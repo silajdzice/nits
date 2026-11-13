@@ -225,6 +225,7 @@ extension DisplayManager {
         var turnedOff = false
         for display in displays where keys[display.id].flatMap({ setup[$0]?.enabled }) == false {
             guard DisplayPower.desktopCount() > 1, DisplayPower.setEnabled(display.id, false) else { continue }
+            noteTurnedOff(display.id)
             offDisplays.append(OffDisplay(id: display.id, name: display.name, key: display.key))
             turnedOff = true
         }

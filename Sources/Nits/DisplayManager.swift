@@ -21,6 +21,9 @@ final class DisplayManager: ObservableObject {
         }
     }
     private static let offDisplaysKey = "offDisplays.v1"
+    /// When Nits turned each display off. macOS takes a moment to mark it inactive; during that moment
+    /// the self-heal in `refresh()` must not drop it (the Keep/Revert fallback needs the entry).
+    private var turnedOffAt: [CGDirectDisplayID: Date] = [:]
     /// The preset applied last; wins the highlight when several presets match the same setup.
     private var lastAppliedPresetID: UUID?
     @Published var presets: [Preset] = PresetStore.load() {
@@ -71,6 +74,14 @@ final class DisplayManager: ObservableObject {
         // Failsafe: if the remaining displays were unplugged, bring back the ones Nits turned off.
         if !offDisplays.isEmpty && DisplayPower.activeCount() == 0 {
             turnAllOn()
+        }
+        // Self-heal: a display listed as off that macOS reports active (or whose ID was reused by another
+        // monitor) isn't off; listing it would hide a working screen.
+        let fresh = Set(turnedOffAt.filter { Date().timeIntervalSince($0.value) < 10 }.keys)
+        let healed = Self.stillOff(offDisplays.filter { !fresh.contains($0.id) }) + offDisplays.filter { fresh.contains($0.id) }
+        if healed.count != offDisplays.count {
+            Log.displays.notice("Dropped \(self.offDisplays.count - healed.count, privacy: .public) stale off entries")
+            offDisplays = healed
         }
         let off = Set(offDisplays.map(\.id))
         let services = DDCService.all()
@@ -192,29 +203,32 @@ final class DisplayManager: ObservableObject {
         lastAppliedPresetID = preset.id
     }
 
-    /// Displays that are connected but turned off: macOS drops them from the online list, but still
-    /// answers vendor/model queries for their IDs. Combines Nits' saved list with a probe of low IDs
-    /// (Apple Silicon numbers displays 1, 2, 3...), so displays turned off by an earlier, killed Nits
-    /// or by another app still show up with a Turn on button.
+    /// Displays Nits turned off in an earlier run that are still off (after a crash or a kill, nothing
+    /// turned them back on). Only Nits' own saved list counts: macOS keeps answering vendor/model queries
+    /// for a display for a while after it's *unplugged*, so probing IDs would mistake an unplugged
+    /// monitor for a turned-off one, and then hide it when it's plugged back in under a reused ID.
     private static func discoverOffDisplays() -> [OffDisplay] {
         let saved = UserDefaults.standard.data(forKey: offDisplaysKey)
             .flatMap { try? JSONDecoder().decode([OffDisplay].self, from: $0) } ?? []
-        let services = DDCService.all()
-        var result: [OffDisplay] = []
-        for id in Set(saved.map(\.id)).union(1...32).sorted() {
-            let vendor = CGDisplayVendorNumber(id)
-            guard CGDisplayIsOnline(id) == 0, vendor != 0, vendor != 0xFFFF_FFFF else { continue }
-            // A closed lid takes the built-in screen offline too; only list it if Nits turned it off.
-            if CGDisplayIsBuiltin(id) != 0 && !saved.contains(where: { $0.id == id }) { continue }
-            let model = CGDisplayModelNumber(id)
-            let serial = CGDisplaySerialNumber(id)
-            let name = saved.first { $0.id == id }?.name
-                ?? (CGDisplayIsBuiltin(id) != 0 ? "Built-in Display" : nil)
-                ?? services.first { $0.vendor == vendor && $0.product == model }?.productName
-                ?? "Display \(id)"
-            result.append(OffDisplay(id: id, name: name, key: DisplayKey.make(vendor: vendor, model: model, serial: serial)))
-        }
-        return result
+        return stillOff(saved)
+    }
+
+    /// Drops entries that are no longer "turned off by Nits": the display is active again (turned on,
+    /// replugged), gone, or its ID now belongs to a different monitor.
+    static func stillOff(_ entries: [OffDisplay]) -> [OffDisplay] {
+        filterOff(entries,
+                  isActive: { CGDisplayIsActive($0) != 0 },
+                  currentKey: { id in
+                      let vendor = CGDisplayVendorNumber(id)
+                      guard vendor != 0, vendor != 0xFFFF_FFFF else { return nil }
+                      return DisplayKey.make(vendor: vendor, model: CGDisplayModelNumber(id), serial: CGDisplaySerialNumber(id))
+                  })
+    }
+
+    /// Pure core of `stillOff`, unit tested.
+    static func filterOff(_ entries: [OffDisplay], isActive: (CGDirectDisplayID) -> Bool,
+                          currentKey: (CGDirectDisplayID) -> String?) -> [OffDisplay] {
+        entries.filter { entry in !isActive(entry.id) && currentKey(entry.id) == entry.key }
     }
 
     /// Turns a display off, then asks to keep it that way. Doing nothing turns it back on after 15 s:
@@ -236,6 +250,7 @@ final class DisplayManager: ObservableObject {
             return
         }
         let id = display.id
+        turnedOffAt[id] = Date()
         offDisplays.append(OffDisplay(id: id, name: display.name, key: display.key))
         restoreModes(saved)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
@@ -298,6 +313,8 @@ final class DisplayManager: ObservableObject {
         let all = CGDisplayCopyAllDisplayModes(id, options) as? [CGDisplayMode] ?? []
         return all.first { sameMode($0, wanted) }
     }
+
+    func noteTurnedOff(_ id: CGDirectDisplayID) { turnedOffAt[id] = Date() }
 
     func turnAllOn() {
         for display in offDisplays {

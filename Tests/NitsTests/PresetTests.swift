@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import Testing
 @testable import Nits
@@ -65,5 +66,22 @@ private func off(_ name: String) -> DisplayState { DisplayState(name: name, enab
         #expect(a != b)
         let data = try JSONEncoder().encode(["g": a])
         #expect(try JSONDecoder().decode([String: ModeRecord].self, from: data) == ["g": a])
+    }
+}
+
+@Suite struct OffDisplayTests {
+    typealias Off = DisplayManager.OffDisplay
+
+    @Test func keepsOnlyDisplaysThatAreStillOffAndStillTheSameMonitor() {
+        let entries = [
+            Off(id: 1, name: "Built-in", key: "b"),   // still off
+            Off(id: 3, name: "G27U", key: "g"),       // replugged: ID 3 is active again
+            Off(id: 2, name: "Dell", key: "d"),       // ID 2 now belongs to another monitor
+            Off(id: 9, name: "Old", key: "o"),        // gone entirely
+        ]
+        let active: Set<CGDirectDisplayID> = [3]
+        let keys: [CGDirectDisplayID: String] = [1: "b", 3: "g", 2: "g"]
+        let result = DisplayManager.filterOff(entries, isActive: { active.contains($0) }, currentKey: { keys[$0] })
+        #expect(result.map(\.id) == [1])
     }
 }
