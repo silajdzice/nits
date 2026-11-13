@@ -57,3 +57,13 @@ private func off(_ name: String) -> DisplayState { DisplayState(name: name, enab
         #expect(try JSONDecoder().decode([Preset].self, from: data) == [preset])
     }
 }
+
+@Suite struct ModeRecordTests {
+    @Test func fractionalRatesStayDistinctAndRoundTrip() throws {
+        let a = ModeRecord(width: 1920, height: 1080, pixelWidth: 3840, refreshRate: 6000)
+        let b = ModeRecord(width: 1920, height: 1080, pixelWidth: 3840, refreshRate: 5994)
+        #expect(a != b)
+        let data = try JSONEncoder().encode(["g": a])
+        #expect(try JSONDecoder().decode([String: ModeRecord].self, from: data) == ["g": a])
+    }
+}

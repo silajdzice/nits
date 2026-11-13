@@ -33,6 +33,25 @@ final class DisplayManager: ObservableObject {
     @Published private(set) var layoutBroken = false
     private var pendingRefresh: DispatchWorkItem?
 
+    // MARK: Remembered modes
+    /// Each display's last mode while the set of screens was stable, keyed by `presetKeys()`.
+    /// When screens come or go, macOS often falls back to a default mode (e.g. a 4K monitor jumping to
+    /// "looks like 3360×1890" after an HDMI replug); Nits puts the remembered mode back.
+    private var rememberedModes: [String: ModeRecord] = ModeRecord.load() {
+        didSet { ModeRecord.save(rememberedModes) }
+    }
+    private var lastDisplaySet: Set<CGDirectDisplayID>?
+    /// A display was added, removed, enabled or disabled since the last refresh. Catches an unplug and
+    /// replug that land inside one refresh debounce, where the set of IDs looks unchanged.
+    fileprivate var topologyChanged = false
+    /// While settling after a change, modes are restored and never learned (they may be macOS fallbacks).
+    private var restoreAttemptsLeft = 0
+    private var pendingRestore: DispatchWorkItem?
+    /// Displays whose modes a preset just set; the settling restore leaves them alone.
+    private var restoreExclusions: Set<String> = []
+    private var isSettling: Bool { restoreAttemptsLeft > 0 }
+    private var refreshCount = 0
+
     init() {
         offDisplays = Self.discoverOffDisplays()
         refresh()
@@ -48,6 +67,7 @@ final class DisplayManager: ObservableObject {
     }
 
     func refresh() {
+        refreshCount += 1
         // Failsafe: if the remaining displays were unplugged, bring back the ones Nits turned off.
         if !offDisplays.isEmpty && DisplayPower.activeCount() == 0 {
             turnAllOn()
@@ -60,6 +80,94 @@ final class DisplayManager: ObservableObject {
         displays = ids.map { DisplayController(id: $0, ddc: ddc[$0]) }
         layoutBroken = !ArrangementRepair.isConnected()
         updateActivePreset()
+        Log.displays.notice("Refresh #\(self.refreshCount, privacy: .public): \(ids.count, privacy: .public) on, \(self.offDisplays.count, privacy: .public) off")
+        trackModes(Set(ids))
+    }
+
+    /// Re-reads monitor values (brightness etc.) without rebuilding anything. Cheap: called when the menu opens.
+    /// Re-reads monitor values when the menu opens. Re-matches DDC first if a monitor's DDC connection
+    /// showed up after its display did (common right after a replug).
+    func refreshMonitorValues() {
+        let externalWithoutDDC = displays.filter { !$0.isBuiltin && $0.ddc == nil }.count
+        if externalWithoutDDC > 0, DDCService.all().count > displays.filter({ $0.ddc != nil }).count {
+            refresh()
+            return
+        }
+        for display in displays { display.readDDC() }
+    }
+
+    /// A preset decides the modes of the displays it names; a settling restore must not undo those.
+    /// Other displays (say, one replugged while the preset's prompt was open) are still restored.
+    func excludeFromRestore(_ preset: Preset) {
+        // Only matters for the current settling period; cleared when it ends.
+        if isSettling { restoreExclusions.formUnion(preset.displays.keys) }
+    }
+
+    // MARK: Remembering and restoring modes
+
+    private func trackModes(_ now: Set<CGDirectDisplayID>) {
+        defer { lastDisplaySet = now }
+        guard let previous = lastDisplaySet else { return }   // first refresh after launch: just observe
+
+        if previous != now || topologyChanged {
+            // Screens came or went. macOS applies its fallback modes over the next seconds, sometimes late,
+            // and HiDPI modes can appear late too: restore several times while settling.
+            Log.displays.notice("Display set changed: \(previous.count, privacy: .public) -> \(now.count, privacy: .public)")
+            topologyChanged = false
+            restoreAttemptsLeft = 4
+            scheduleRestore(after: 2)
+            return
+        }
+        learnModes()
+    }
+
+    private func scheduleRestore(after seconds: Double) {
+        pendingRestore?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.restoreAttempt() }
+        pendingRestore = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
+    }
+
+    private func restoreAttempt() {
+        guard isSettling else { return }
+        if isApplyingPreset || RevertPrompt.isBusy {
+            // Someone else is changing modes; keep settling (no learning) and try again shortly.
+            scheduleRestore(after: 2)
+            return
+        }
+        restoreRememberedModes()
+        restoreAttemptsLeft -= 1
+        if isSettling {
+            scheduleRestore(after: 2)
+        } else {
+            restoreExclusions = []
+            Log.displays.notice("Settled")
+        }
+    }
+
+    /// Records each display's current mode, unless the layout is settling or a change awaits Keep/Revert.
+    func learnModes() {
+        guard !isSettling, !isApplyingPreset, !RevertPrompt.isBusy else { return }
+        let keys = presetKeys()
+        for display in displays {
+            guard let key = keys[display.id], let mode = CGDisplayCopyDisplayMode(display.id) else { continue }
+            let record = ModeRecord(mode)
+            if rememberedModes[key] != record { rememberedModes[key] = record }
+        }
+    }
+
+    private func restoreRememberedModes() {
+        let keys = presetKeys()
+        var changed = false
+        for display in displays {
+            guard let key = keys[display.id], !restoreExclusions.contains(key), let want = rememberedModes[key],
+                  let now = CGDisplayCopyDisplayMode(display.id), ModeRecord(now) != want,
+                  let match = want.find(on: display.id) else { continue }
+            Log.displays.notice("Restoring \(display.name, privacy: .public) to \(want.width, privacy: .public)x\(want.height, privacy: .public) from \(now.width, privacy: .public)x\(now.height, privacy: .public)")
+            // Permanently: macOS then remembers it for this set of screens too.
+            changed = DisplayConfig.apply(match, to: display.id, option: .permanently) || changed
+        }
+        if changed { ArrangementRepair.repairIfNeeded() }
     }
 
     static func matchDDC(_ ids: [CGDirectDisplayID], _ services: [DDCService]) -> [CGDirectDisplayID: DDCService] {
@@ -209,6 +317,12 @@ final class DisplayManager: ObservableObject {
 
 private func displayReconfigured(_ id: CGDirectDisplayID, _ flags: CGDisplayChangeSummaryFlags, _ info: UnsafeMutableRawPointer?) {
     guard let info, !flags.contains(.beginConfigurationFlag) else { return }
+    Log.displays.debug("Reconfigured display \(id, privacy: .public) flags=\(flags.rawValue, privacy: .public)")
     let manager = Unmanaged<DisplayManager>.fromOpaque(info).takeUnretainedValue()
-    DispatchQueue.main.async { manager.scheduleRefresh() }
+    let topology: CGDisplayChangeSummaryFlags = [.addFlag, .removeFlag, .enabledFlag, .disabledFlag]
+    let changed = !flags.isDisjoint(with: topology)
+    DispatchQueue.main.async {
+        if changed { manager.topologyChanged = true }
+        manager.scheduleRefresh()
+    }
 }

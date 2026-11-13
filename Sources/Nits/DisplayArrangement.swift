@@ -24,43 +24,72 @@ enum DisplayArrangement {
 }
 
 /// Rotation through MonitorPanel's private `MPDisplay` (the class System Settings > Displays uses).
-/// Looked up at runtime: if a macOS update removes it, the rotation menu just disappears.
+///
+/// MonitorPanel is expensive: its shared display manager builds a mode table for every display with an
+/// all-pairs comparison (about 20 s and 700 MB on a 4K/160 Hz monitor), and once loaded it redoes that
+/// on the main thread after every display change. So the menu bar app never loads it. Rotation runs in
+/// a short-lived helper process (this same binary with `--rotate`), which exits afterwards.
 enum DisplayRotation {
-    private typealias InitWithID = @convention(c) (UnsafeRawPointer, Selector, Int32) -> UnsafeRawPointer?
-    private typealias GetBool = @convention(c) (UnsafeRawPointer, Selector) -> Bool
-    private typealias SetInt = @convention(c) (UnsafeRawPointer, Selector, Int32) -> Void
+    /// Built-in panels can't be rotated; external displays generally can. Checked without MonitorPanel.
+    static func canRotate(_ id: CGDirectDisplayID) -> Bool { CGDisplayIsBuiltin(id) == 0 }
 
-    private static let displayClass: NSObject.Type? = {
-        dlopen("/System/Library/PrivateFrameworks/MonitorPanel.framework/MonitorPanel", RTLD_LAZY)
-        return NSClassFromString("MPDisplay") as? NSObject.Type
-    }()
+    static func isValid(_ degrees: Int) -> Bool { [0, 90, 180, 270].contains(degrees) }
 
-    private static func mpDisplay(_ id: CGDirectDisplayID) -> NSObject? {
-        let initSelector = NSSelectorFromString("initWithCGSDisplayID:")
-        guard let cls = displayClass, cls.instancesRespond(to: initSelector),
-              let allocated = (cls as AnyObject).perform(NSSelectorFromString("alloc")) else { return nil }
-        // alloc returns +1 and init consumes it and returns +1, so ownership moves straight through.
-        let pointer = allocated.toOpaque()
-        let initialize = unsafeBitCast(cls.instanceMethod(for: initSelector), to: InitWithID.self)
-        guard let result = initialize(pointer, initSelector, Int32(bitPattern: id)) else { return nil }
-        return Unmanaged<NSObject>.fromOpaque(result).takeRetainedValue()
+    /// Rotates in the helper process; `done(true)` on the main thread once the helper reports success.
+    static func set(_ id: CGDirectDisplayID, degrees: Int, done: @escaping (Bool) -> Void) {
+        guard isValid(degrees), let executable = Bundle.main.executableURL else { return done(false) }
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["--rotate", String(id), String(degrees)]
+        process.terminationHandler = { finished in
+            let ok = finished.terminationReason == .exit && finished.terminationStatus == 0
+            DispatchQueue.main.async { done(ok) }
+        }
+        do {
+            try process.run()
+        } catch {
+            done(false)
+            return
+        }
+        // Never wait forever on the helper.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 90) {
+            if process.isRunning { process.terminate() }
+        }
     }
 
-    static func canRotate(_ id: CGDirectDisplayID) -> Bool {
-        let selector = NSSelectorFromString("canChangeOrientation")
-        guard let display = mpDisplay(id), display.responds(to: selector) else { return false }
-        let call = unsafeBitCast(display.method(for: selector), to: GetBool.self)
-        return call(Unmanaged.passUnretained(display).toOpaque(), selector)
+    @MainActor
+    static func set(_ id: CGDirectDisplayID, degrees: Int) async -> Bool {
+        await withCheckedContinuation { continuation in
+            set(id, degrees: degrees) { continuation.resume(returning: $0) }
+        }
     }
 
-    @discardableResult
-    static func set(_ id: CGDirectDisplayID, degrees: Int) -> Bool {
-        let selector = NSSelectorFromString("setOrientation:")
-        guard let display = mpDisplay(id), display.responds(to: selector) else { return false }
-        let call = unsafeBitCast(display.method(for: selector), to: SetInt.self)
-        guard [0, 90, 180, 270].contains(degrees) else { return false }
-        call(Unmanaged.passUnretained(display).toOpaque(), selector, Int32(degrees))
-        return true
+    /// Helper-process entry point (`Nits --rotate <id> <degrees>`). Returns the exit code.
+    static func runHelper(_ arguments: [String]) -> Int32 {
+        guard arguments.count == 2, let id = UInt32(arguments[0]), let degrees = Int(arguments[1]), isValid(degrees) else { return 2 }
+        return Panel.setOrientation(CGDirectDisplayID(id), degrees: degrees) ? 0 : 1
+    }
+
+    /// Direct MonitorPanel access. Only ever used inside the helper process.
+    private enum Panel {
+        typealias InitWithID = @convention(c) (UnsafeRawPointer, Selector, Int32) -> UnsafeRawPointer?
+        typealias SetInt = @convention(c) (UnsafeRawPointer, Selector, Int32) -> Void
+
+        static func setOrientation(_ id: CGDirectDisplayID, degrees: Int) -> Bool {
+            dlopen("/System/Library/PrivateFrameworks/MonitorPanel.framework/MonitorPanel", RTLD_LAZY)
+            let initSelector = NSSelectorFromString("initWithCGSDisplayID:")
+            let setSelector = NSSelectorFromString("setOrientation:")
+            guard let cls = NSClassFromString("MPDisplay") as? NSObject.Type, cls.instancesRespond(to: initSelector),
+                  let allocated = (cls as AnyObject).perform(NSSelectorFromString("alloc")) else { return false }
+            // alloc returns +1 and init consumes it and returns +1, so ownership moves straight through.
+            let initialize = unsafeBitCast(cls.instanceMethod(for: initSelector), to: InitWithID.self)
+            guard let result = initialize(allocated.toOpaque(), initSelector, Int32(bitPattern: id)) else { return false }
+            let display = Unmanaged<NSObject>.fromOpaque(result).takeRetainedValue()
+            guard display.responds(to: setSelector) else { return false }
+            let call = unsafeBitCast(display.method(for: setSelector), to: SetInt.self)
+            call(Unmanaged.passUnretained(display).toOpaque(), setSelector, Int32(degrees))
+            return true
+        }
     }
 }
 

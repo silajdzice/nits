@@ -25,6 +25,8 @@ screens off without unplugging them.
 - **Turn a display off** without unplugging it, such as the MacBook's built-in screen. Nits never turns
   off the last active display, asks you to confirm (doing nothing turns it back on), and turns
   everything back on when it quits.
+- **Remembers resolutions.** When a monitor is unplugged and plugged back in (or another screen comes
+  or goes), macOS often switches to a default resolution. Nits restores the one you were using.
 - **Arrangement repair.** Detects screens that touch only at a corner (the cursor can't cross) and moves
   them the shortest distance to share an edge.
 - Refresh rate, rotation, main display, launch at login.
@@ -92,7 +94,11 @@ update removes one, that feature disappears instead of the app crashing.
 | --- | --- |
 | DDC/CI | `IOAVServiceCreateWithService`, `IOAVServiceReadI2C`, `IOAVServiceWriteI2C` (IOKit) |
 | Turn a display off | `SLSConfigureDisplayEnabled` (SkyLight) |
-| Rotation | `MPDisplay` (MonitorPanel) |
+| Rotation | `MPDisplay` (MonitorPanel), run in a short-lived helper process |
+
+MonitorPanel builds a large mode table when it loads (seconds of work and hundreds of MB on a 4K
+high-refresh monitor) and redoes it on every display change, so the menu bar app never loads it: each
+rotation runs `Nits --rotate <display> <degrees>` as a separate process that exits afterwards.
 
 These can break in any macOS release. Nits can't be distributed through the Mac App Store because of
 them.
@@ -104,6 +110,16 @@ them.
 - **New HiDPI modes don't appear:** unplug and replug the monitor, or log out and back in.
 - **Two display managers at once:** don't let Nits and another display app manage the same display;
   quit one of them.
+
+## Logs
+
+Nits writes to the unified log. To see what it did around a display change:
+
+```bash
+/usr/bin/log show --last 30m --info --predicate 'subsystem == "com.edhem.nits"'
+```
+
+(Use the full path in zsh, where `log` is a shell built-in.)
 
 ## Acknowledgements
 

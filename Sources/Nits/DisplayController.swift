@@ -111,16 +111,25 @@ final class DisplayController: ObservableObject, Identifiable {
             message = "Confirm or revert the previous change first."
             return
         }
-        guard DisplayRotation.set(id, degrees: degrees) else {
-            RevertPrompt.end()
-            return
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            if !RevertPrompt.confirmKeep(title: "Keep this rotation?") {
-                DisplayRotation.set(self.id, degrees: previous)
+        message = "Rotating\u{2026} this can take a few seconds."
+        DisplayRotation.set(id, degrees: degrees) { ok in
+            guard ok else {
+                RevertPrompt.end()
+                self.message = "macOS refused to rotate this display."
+                return
             }
-            RevertPrompt.end()
-            self.reloadModes()
+            self.message = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                if RevertPrompt.confirmKeep(title: "Keep this rotation?") {
+                    RevertPrompt.end()
+                    self.reloadModes()
+                } else {
+                    DisplayRotation.set(self.id, degrees: previous) { _ in
+                        RevertPrompt.end()
+                        self.reloadModes()
+                    }
+                }
+            }
         }
     }
 

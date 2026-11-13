@@ -32,6 +32,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// `Nits --rotate <id> <degrees>`: rotation helper process (see DisplayRotation). No UI.
+if let i = CommandLine.arguments.firstIndex(of: "--rotate") {
+    exit(DisplayRotation.runHelper(Array(CommandLine.arguments.dropFirst(i + 1))))
+}
 // `Nits --dump` prints what the app sees, without touching any display.
 if CommandLine.arguments.contains("--dump") {
     Diagnostics.dump()

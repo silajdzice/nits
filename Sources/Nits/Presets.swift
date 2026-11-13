@@ -178,8 +178,10 @@ extension DisplayManager {
                 ArrangementRepair.repairIfNeeded()
             }
             RevertPrompt.end()
+            self.excludeFromRestore(preset)
             self.isApplyingPreset = false
             self.refresh()
+            self.learnModes()
         }
     }
 
@@ -209,7 +211,7 @@ extension DisplayManager {
         for display in displays {
             guard let want = keys[display.id].flatMap({ setup[$0] }), want.enabled, let degrees = want.rotation,
                   degrees != Int(CGDisplayRotation(display.id)), display.canRotate else { continue }
-            rotated = DisplayRotation.set(display.id, degrees: degrees) || rotated
+            rotated = await DisplayRotation.set(display.id, degrees: degrees) || rotated
         }
         if rotated { await settle() }
 
